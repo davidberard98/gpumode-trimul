@@ -6,6 +6,12 @@ author: davidberard98
 categories: [gpu, optimization, cuda, triton]
 ---
 
+# GPU Mode: Trimul
+
+**David Berard** | October 2, 2025
+
+---
+
 I spent a day or two working on the GPU Mode kernel challenge for the Trimul operator. This challenge involves optimizing a key operation from AlphaFold3 that processes pairwise sequence embeddings—tensors with shape `[batch, seq_len, seq_len, hidden_dim]`.
 
 Here's a quick overview of my solution and how I approached the problem. Unfortunately, I wrote this all after the fact and don't remember specific numbers or details, so I've substituted approximations in many places.
@@ -14,28 +20,13 @@ Here's a quick overview of my solution and how I approached the problem. Unfortu
 
 ## The Problem: Outgoing TriMul Kernel
 
-The challenge involves optimizing a "triangle multiplication" operator used in AlphaFold3. Unlike typical language model sequences, this works with **pairwise sequences of embeddings**—your tensor has a (small) batch size, two sequence dimensions of equal size, and a hidden dimension.
-
-Given a tensor **Z** ∈ ℝ^(B × N × N × c_z), the operator computes a transformed version through two parallel paths that eventually combine via a batched matrix multiplication (where the batch dimension is actually the sequence dimension).
-
-The key operations include:
-- LayerNorm and linear transformations
-- Sigmoid activations and masking
-- A triangle multiplication: `einsum('... i k d, ... j k d -> ... i j d', left, right)`
-- Final output transformations
-
-**Why is this hard?** You have to choose whether to optimize for the channel dimensions (needed for LayerNorms) or the sequence dimension N. The sequence dimension is particularly challenging because it's large and we compute pairwise operations that sum over another sequence dimension (O(N³) complexity). The problem tests whether you can effectively fuse operations that torch.compile() doesn't handle well.
-
-Problem constraints:
-- B ∈ {1,2}, N ∈ {128,256,512,1024}, c ∈ {128}, c_z ∈ {128,384,768}
-- Input distributions: standard Normal or heavy-tailed Cauchy (γ=2)
-- Accuracy requirements: relatively lenient (atol, rtol of 2e-2)
+The challenge involves optimizing a "triangle multiplication" operator used in AlphaFold3. For full problem details, see the [challenge description](https://tinyurl.com/gpumode-trimul).
 
 ## Setup / Testing
 
 I don't have a local GPU, but in the past I've been accustomed to having access to an H100 with NCU permissions.
 
-I spent a total of about $20, mostly on [vast.ai](http://vast.ai) compute. For the most part I rented a 5070-5090 just for local testing to make sure that my kernels were functional, and occasionally I would rent an A100 (~$0.70/hr), H100 (~$2/hr), or B200 (~$8/hr) for performance tuning and profiling.
+I spent a total of about $20, mostly on [vast.ai](http://vast.ai) compute. For the most part I rented a 5070-5090 just for local testing to make sure that my kernels were functional, and occasionally I would rent an A100 (\~$0.70/hr), H100 (\~$2/hr), or B200 (\~$8/hr) for performance tuning and profiling.
 
 I was mostly targeting H100 because it is the platform I was most familiar with.
 
@@ -78,7 +69,84 @@ I mostly prompted Claude Code for help writing this kernel, and I was pretty imp
 
 I don't think this kernel is very well optimized; from my memory, I vaguely recall that it was getting around 300-400 TFlops on H100 for the B=2, SL=512, dim=384 case that I was doing most of my local testing on. But at least on H100, it appeared to provide modest speedups and was better than the unfused implementation.
 
-**TODO: Add a sketch implementation of the kernel**
+Here's a simplified sketch of the kernel structure:
+
+```python
+@triton.jit
+def two_mm_fused_kernel(
+    x_ptr, weight1_ptr, weight2_ptr, gate1_ptr, gate2_ptr, gate_out_ptr,
+    out1_ptr, out2_ptr, out_gate_ptr, mask_ptr,
+    M, N, K,  # M = batch*seq_len*seq_len, N = hidden_dim, K = input_dim
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr
+):
+    """
+    Fused kernel computing:
+    1. Five matmuls: x @ weight1, x @ weight2, x @ gate1, x @ gate2, x @ gate_out
+    2. Apply mask to first two outputs (left_proj, right_proj)
+    3. Apply sigmoid to gates
+    4. Elementwise multiply: left *= left_gate, right *= right_gate
+    5. Store results with permuted layout for later BMM
+    """
+    
+    # Calculate which tile this thread block handles
+    pid_m = tl.program_id(0) // num_blocks_n
+    pid_n = tl.program_id(0) % num_blocks_n
+    
+    # Initialize accumulators for all five matmuls
+    acc_left = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_right = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_left_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_right_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_out_gate = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    # Loop over K dimension, computing all five matmuls in parallel
+    for k_block in range(0, K, BLOCK_K):
+        # Load input block and all weight blocks
+        x_block = tl.load(x_ptr + offsets_x)
+        w1 = tl.load(weight1_ptr + offsets_w)
+        w2 = tl.load(weight2_ptr + offsets_w)
+        g1 = tl.load(gate1_ptr + offsets_w)
+        g2 = tl.load(gate2_ptr + offsets_w)
+        g_out = tl.load(gate_out_ptr + offsets_w)
+        
+        # Accumulate all matmuls using tensor cores
+        acc_left = tl.dot(x_block, w1.T, acc_left, allow_tf32=True)
+        acc_right = tl.dot(x_block, w2.T, acc_right, allow_tf32=True)
+        acc_left_gate = tl.dot(x_block, g1.T, acc_left_gate, allow_tf32=True)
+        acc_right_gate = tl.dot(x_block, g2.T, acc_right_gate, allow_tf32=True)
+        acc_out_gate = tl.dot(x_block, g_out.T, acc_out_gate, allow_tf32=True)
+    
+    # --- Epilogue: fused operations ---
+    
+    # Load mask and apply to left/right projections
+    mask = tl.load(mask_ptr + offsets_m)
+    acc_left = tl.where(mask[:, None], acc_left, 0)
+    acc_right = tl.where(mask[:, None], acc_right, 0)
+    
+    # Apply sigmoid activation to gates
+    left_gate = sigmoid(acc_left_gate)
+    right_gate = sigmoid(acc_right_gate)
+    out_gate = sigmoid(acc_out_gate)
+    
+    # Elementwise multiply with gates
+    left_final = acc_left * left_gate
+    right_final = acc_right * right_gate
+    
+    # Store with permuted indices: [batch, dim, seq_len, seq_len]
+    # instead of [batch, seq_len, seq_len, dim]
+    # This prepares data for efficient BMM later
+    tl.store(out1_ptr + permuted_offsets, left_final)
+    tl.store(out2_ptr + permuted_offsets, right_final)
+    tl.store(out_gate_ptr + permuted_offsets, out_gate)
+```
+
+**Key ideas:**
+1. **Persistent matmul loop**: Single pass over K dimension computes all 5 matmuls simultaneously
+2. **Fused epilogue**: Mask, sigmoid, and elementwise ops happen in registers without writing to memory
+3. **Output permutation**: Results stored in `[B, D, SL, SL]` layout instead of `[B, SL, SL, D]` to enable efficient BMM next
+4. **Single kernel launch**: Replaces ~10 separate PyTorch operations with one kernel
+
+The real implementation uses TMA (Tensor Memory Accelerator) for efficient loading and more complex indexing logic, but this captures the optimization strategy.
 
 ### 2. Fuse/Improve the LayerNorms
 
@@ -165,7 +233,7 @@ I was able to get one A100 submission to pass the timeout issues—it wasn't the
 
 With a vast.ai rental, I observed with torch.profile that `two_mm` was the obvious bottleneck.
 
-**TODO: Add profiler screenshot showing two_mm bottleneck**
+![A100 profiler trace showing two_mm as the bottleneck](https://davidberard98.github.io/gpumode-trimul/long-a100-twomm.png)
 
 I then wasted an hour trying to find a cloud provider with A100s that supported NCU.
 
@@ -181,14 +249,11 @@ If I had a bit more time, I would want to do a few more investigations:
 
 ## Conclusion
 
-This was a fun challenge that required balancing multiple optimization strategies: kernel fusion, memory layout optimization, mixed precision, and lots of debugging. The experience reinforced how important it is to profile early and often, and how challenging it can be to optimize for multiple GPU architectures simultaneously.
-
-The trickiest parts were:
-1. Dealing with the non-contiguous memory layouts required by the problem
-2. Debugging timeout issues in the automated evaluation system
-3. Balancing compile-time costs with runtime performance gains
-
-Thanks again to the GPU Mode team for organizing this challenge! Looking forward to the next one.
+This was a super fun problem! Overall, my takeaways were:
+* Start with a torch.profile to understand what's taking a long time. I didn't realize at first that the layernorms were so slow, but this was one of the easiest and most impactful changes I made.
+* Claude does a pretty good job with Triton kernels
+* Cloud providers supporting NCU are hard to find
+* Benchmarking is hard!
 
 ---
 
