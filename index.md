@@ -12,9 +12,9 @@ categories: [gpu, optimization, cuda, triton]
 
 ---
 
-I spent a day or two working on the GPU Mode kernel challenge for the Trimul operator. This challenge involves optimizing a key operation from AlphaFold3 that processes pairwise sequence embeddings—tensors with shape `[batch, seq_len, seq_len, hidden_dim]`.
+I spent a day or two working on the [GPU Mode kernel challenge for the Trimul operator](https://tinyurl.com/gpumode-trimul). This challenge involves optimizing a key operation from AlphaFold3 that processes pairwise sequence embeddings—tensors with shape `[batch, seq_len, seq_len, hidden_dim]`.
 
-Here's a quick overview of my solution and how I approached the problem. Unfortunately, I wrote this all after the fact and don't remember specific numbers or details, so I've substituted approximations in many places.
+Here's a quick overview of my solution and how I approached the problem. As a disclaimer, I didn't record most of this during the contest; this is best-effort recollection of the steps I took using re-creations of the approximate state of the code to get performance numbers after each step.
 
 **Huge thanks to the GPU mode team and the problem authors (Mark Saroufim, Matej Sirovatka, Alex Zhang, and I'm sure many other people I haven't mentioned)**. It was a super fun project and I wish I had a bit more time to look more deeply at the problem! And congrats to [Arseni Ivanov](https://arseniivanov.github.io/blog.html) who won the contest for A100 and MI300!
 
@@ -24,15 +24,13 @@ The challenge involves optimizing a "triangle multiplication" operator used in A
 
 ## Setup / Testing
 
-I don't have a local GPU, but in the past I've been accustomed to having access to an H100 with NCU permissions.
+I don't have a local GPU, so I rented compute. I spent a total of about $20, mostly on vast.ai compute. For the most part I rented a 5070-5090 just for local testing to make sure that my kernels were functional, and occasionally I would rent an A100 (\~$0.70/hr), H100 (\~$2/hr), or B200 (\~$8/hr) for performance tuning and profiling.
 
-I spent a total of about $20, mostly on [vast.ai](http://vast.ai) compute. For the most part I rented a 5070-5090 just for local testing to make sure that my kernels were functional, and occasionally I would rent an A100 (\~$0.70/hr), H100 (\~$2/hr), or B200 (\~$8/hr) for performance tuning and profiling.
-
-I was mostly targeting H100 because it is the platform I was most familiar with.
+I was mostly targeting H100 because it is the platform I am most familiar with.
 
 ## Strategy
 
-As stated in the problem remarks, it's quite difficult to fuse this into a single kernel efficiently. You have to pick between optimizing for channel dimensions (LayerNorms) or sequence dimensions, and can't easily do both without synchronization barriers.
+As stated in the problem remarks, it's quite difficult to fuse this into a single kernel efficiently. The layernorm reductions encourage certain blocking strategies, while the matmuls encourage others.
 
 So I decided to skip the "perfect fusion" approach and start with easier, incremental optimizations.
 
@@ -40,11 +38,11 @@ So I decided to skip the "perfect fusion" approach and start with easier, increm
 
 ### 0. Functional Implementation
 
+**Baseline performance:** 8.61ms
+
 I started by making the implementation functional instead of using an nn.Module, to simplify the process of replacing operations with fused/custom versions.
 
 I also [enabled tf32](https://docs.pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices) to enable tensor cores.
-
-**Baseline performance:** 8.61ms
 
 ### 1. Fuse the Linear Computations
 
@@ -67,9 +65,9 @@ left = left * left_gate
 right = right * right_gate
 ```
 
-Instead, I wrote a **Triton persistent matmul kernel (with TMA)** which implements a matmul loop iterating over blocks of `x`, `left_proj`, `right_proj`, `left_gate`, `right_gate`, `out_gate`; and then in the epilogue, does masking, computes sigmoids, and performs elementwise multiplications. In my implementation it's called `two_mm` (because initially it only did two matmuls before I fused more computations into the kernel, and I never renamed it).
+I wrote a **Triton persistent matmul kernel (with TMA)** which implements a matmul loop iterating over blocks of `x`, `left_proj`, `right_proj`, `left_gate`, `right_gate`, `out_gate`; and then in the epilogue, does masking, computes sigmoids, and performs elementwise multiplications. In my implementation it's called `two_mm` (because initially it only did two matmuls before I fused more computations into the kernel, and I never renamed it).
 
-I mostly prompted Claude Code for help writing this kernel, and I was pretty impressed—it probably made fewer mistakes than I would have.
+I mostly prompted Claude Code for help writing this kernel, and I was pretty impressed—it probably made fewer mistakes than I would have. I initially gave it the [09-persistent-matmul tutorial](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html) and asked it to modify it.
 
 I don't think this kernel is very well optimized; from my memory, I vaguely recall that it was getting around 300-400 TFlops on H100 for the B=2, SL=512, dim=384 case that I was doing most of my local testing on. But at least on H100, it appeared to provide modest speedups and was better than the unfused implementation.
 
@@ -136,25 +134,15 @@ def two_mm_fused_kernel(
     left_final = acc_left * left_gate
     right_final = acc_right * right_gate
     
-    # Store with permuted indices: [batch, dim, seq_len, seq_len]
-    # instead of [batch, seq_len, seq_len, dim]
-    # This prepares data for efficient BMM later
-    tl.store(out1_ptr + permuted_offsets, left_final)
-    tl.store(out2_ptr + permuted_offsets, right_final)
-    tl.store(out_gate_ptr + permuted_offsets, out_gate)
+    # Store results
+    tl.store(out1_ptr + out_offsets, left_final)
+    tl.store(out2_ptr + out_offsets, right_final)
+    tl.store(out_gate_ptr + out_offsets, out_gate)
 ```
 
-**Key ideas:**
-1. **Persistent matmul loop**: Single pass over K dimension computes all 5 matmuls simultaneously
-2. **Fused epilogue**: Mask, sigmoid, and elementwise ops happen in registers without writing to memory
-3. **Output permutation**: Results stored in `[B, D, SL, SL]` layout instead of `[B, SL, SL, D]` to enable efficient BMM next
-4. **Single kernel launch**: Replaces ~10 separate PyTorch operations with one kernel
-
-The real implementation uses TMA (Tensor Memory Accelerator) for efficient loading and more complex indexing logic, but this captures the optimization strategy.
-
-**Performance after fusing linear computations:** 6.28ms (27% latency reduction from baseline)
-
 ### 2. Fuse/Improve the LayerNorms
+
+**Performance after custom LayerNorms (and fixing timeout issues from step 3):** 4.58ms (47% latency reduction from baseline, 27% from step 1)
 
 At this point I collected a kineto trace, and observed that the layernorm kernels were actually quite slow, at perhaps half of peak memory bandwidth on the H100 that I had rented.
 
@@ -179,8 +167,6 @@ x = self.norm(x)
 
 Locally, I saw huge wins from this. But when I submitted to the leaderboard, I saw timeouts. I believe my first H100 submission went through, but after that I wasn't able to get any submissions to pass.
 
-**Performance after custom LayerNorms:** 4.58ms (47% latency reduction from baseline, 27% from step 1)
-
 ### 3. Debugging Timeouts
 
 I spent a while submitting to the leaderboard to try to identify what I was doing wrong. I was skeptical from the beginning, because I was surprised that my only successful submission with a custom-first-layernorm took nearly twice the time as the pytorch-layernorm submission, while I expected the compile time / autotuning time of the layernorm to be relatively small. 
@@ -204,6 +190,8 @@ I submitted a [PR to move the Cauchy distribution calculation onto GPU](https://
 
 ### 4. Einsum to BMM
 
+**Performance after einsum to BMM conversion:** 2.73ms (68% latency reduction from baseline, 40% from step 2)
+
 In a profiler trace, I observed that the einsum introduced a bunch of data layout permutations (on GPU), and the gemm kernel itself was somewhat slow.
 
 The einsum:
@@ -225,13 +213,29 @@ I added these transformations and then replaced the einsum with a bmm.
 
 Next, I **fused the permutations into the preceding `two_mm` kernel**, which ended up being mainly a bunch of indexing logic for computing the offsets of the outputs. (Claude didn't get the right implementation, but I implemented a buggy version and Claude fixed it)
 
+The key part of the fused permutation logic:
+
+```python
+# Decompose flattened indices back to 4D coordinates
+off_c_batch = offs_cm // (seq_len * seq_len)
+off_c_sl1 = (offs_cm // seq_len) % seq_len
+off_c_sl2 = offs_cm % seq_len
+off_c_dim = offs_cn
+
+# Calculate offsets for transposed layout [B, D, SL, SL] instead of [B, SL, SL, D]
+c_offsets = (
+    (off_c_batch * stride_c0 + off_c_sl1 * stride_c1 + off_c_sl2 * stride_c2)[:, None] + 
+    off_c_dim[None, :] * stride_c3
+)
+```
+
 ### 5. Data Types
+
+**Performance fp16 usage:** 1.91ms (77% latency reduction from baseline, 30% from step 2)
 
 The problem has relatively lenient accuracy requirements (atol, rtol of 2e-2). So I converted everything except the input and the output to fp16. This has two benefits: faster matmuls and reduced memory transfer.
 
 I don't remember how much speedup we get from this, but it was a lot. The previous custom kernels/fusions were helpful to allow us to fuse all the dtype conversions into kernels and actually benefit from the reduced memory transfers.
-
-**Performance after fp16 conversion:** 1.91ms (78% latency reduction from baseline, 30% from step 4)
 
 ### 6. Failed Attempt at A100 / MI300
 
