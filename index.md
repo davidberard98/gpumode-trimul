@@ -34,7 +34,7 @@ As stated in the problem remarks, it's quite difficult to fuse this into a singl
 
 So I decided to skip the "perfect fusion" approach and start with easier, incremental optimizations.
 
-**Testing configuration:** For most of my local testing and the performance numbers below, I used `seq_len=512`, `batch_size=2`, `dim=384`, `hidden_dim=128` on H100.
+**Testing configuration:** For most of my local testing and the performance numbers below, I used `seq_len=512`, `batch_size=2`, `dim=384`, `hidden_dim=128` on H100. Note - these numbers are different from the geomean numbers reported on the leaderboard (1088us for B200, 1371us for H100)
 
 ### 0. Functional Implementation
 
