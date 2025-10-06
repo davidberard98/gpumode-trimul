@@ -1,7 +1,7 @@
 import torch
 from task import input_t, output_t
 from contextlib import nullcontext
-from v2 import custom_kernel
+from impl import custom_kernel
 import math
 
 from triton.testing import do_bench
