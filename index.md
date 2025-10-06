@@ -12,19 +12,19 @@ categories: [gpu, optimization, cuda, triton]
 
 ---
 
-I spent a day or two working on the [GPU Mode kernel challenge for the Trimul operator](https://tinyurl.com/gpumode-trimul). This challenge involves optimizing a key operation from AlphaFold3 that processes pairwise sequence embeddings—tensors with shape `[batch, seq_len, seq_len, hidden_dim]`.
+I spent a day or two working on the [GPU Mode kernel challenge for the Trimul operator](https://tinyurl.com/gpumode-trimul). This challenge involves optimizing a key operation from AlphaFold3 that processes pairwise sequence embeddings—tensors with shape `[batch, seq_len, seq_len, hidden_dim]`. My solution was the fastest on H100 (1371us) and B200 (1088us), but not on A100 or MI300. Implementation: [here](https://github.com/davidberard98/gpumode-trimul/blob/main/impl.py)
 
 Here's a quick overview of my solution and how I approached the problem. As a disclaimer, I didn't record most of this during the contest; this is best-effort recollection of the steps I took using re-creations of the approximate state of the code to get performance numbers after each step.
 
 **Huge thanks to the GPU mode team and the problem authors (Mark Saroufim, Matej Sirovatka, Alex Zhang, and I'm sure many other people I haven't mentioned)**. It was a super fun project and I wish I had a bit more time to look more deeply at the problem! And congrats to [Arseni Ivanov](https://arseniivanov.github.io/blog.html) who won the contest for A100 and MI300!
 
-## The Problem: Outgoing TriMul Kernel
+## The Problem: TriMul Kernel
 
 The challenge involves optimizing a "triangle multiplication" operator used in AlphaFold3. For full problem details, see the [challenge description](https://tinyurl.com/gpumode-trimul).
 
 ## Setup / Testing
 
-I don't have a local GPU, so I rented compute. I spent a total of about $20, mostly on vast.ai compute. For the most part I rented a 5070-5090 just for local testing to make sure that my kernels were functional, and occasionally I would rent an A100 (\~$0.70/hr), H100 (\~$2/hr), or B200 (\~$8/hr) for performance tuning and profiling.
+I don't have a local GPU, so I rented compute. I spent a total of about $20, mostly on vast.ai compute. For the most part I rented a 5070-5090 just for local testing to make sure that my kernels were functional, and occasionally I would rent an A100 (\~$0.70/hr), H100 (\~$1-2/hr), or B200 (\~$8/hr) for performance tuning and profiling.
 
 I was mostly targeting H100 because it is the platform I am most familiar with.
 
@@ -32,7 +32,7 @@ I was mostly targeting H100 because it is the platform I am most familiar with.
 
 As stated in the problem remarks, it's quite difficult to fuse this into a single kernel efficiently. The layernorm reductions encourage certain blocking strategies, while the matmuls encourage others.
 
-So I decided to skip the "perfect fusion" approach and start with easier, incremental optimizations.
+So I decided to avoid having to think about these tradeoffs and start with easier, incremental optimizations in sections of the problem with similar properties.
 
 **Testing configuration:** For most of my local testing and the performance numbers below, I used `seq_len=512`, `batch_size=2`, `dim=384`, `hidden_dim=128` on H100. Note - these numbers are different from the geomean numbers reported on the leaderboard (1088us for B200, 1371us for H100)
 
@@ -45,6 +45,8 @@ I started by making the implementation functional instead of using an nn.Module,
 I also [enabled tf32](https://docs.pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-and-later-devices) to enable tensor cores.
 
 ### 1. Fuse the Linear Computations
+
+**Performance after fusing linear computations**: 6.28ms (27% speedup from baseline)
 
 The original code performs many redundant loads and stores in this section:
 
@@ -65,11 +67,11 @@ left = left * left_gate
 right = right * right_gate
 ```
 
-I wrote a **Triton persistent matmul kernel (with TMA)** which implements a matmul loop iterating over blocks of `x`, `left_proj`, `right_proj`, `left_gate`, `right_gate`, `out_gate`; and then in the epilogue, does masking, computes sigmoids, and performs elementwise multiplications. In my implementation it's called `two_mm` (because initially it only did two matmuls before I fused more computations into the kernel, and I never renamed it).
+I wrote a persistent matmul kernel in Triton which implements a matmul loop iterating over blocks of `x`, `left_proj`, `right_proj`, `left_gate`, `right_gate`, `out_gate`; and then in the epilogue, does masking, computes sigmoids, and performs elementwise multiplications. In my implementation it's called `two_mm` (because initially it only did two matmuls before I fused more computations into the kernel, and I never renamed it).
 
 I mostly prompted Claude Code for help writing this kernel, and I was pretty impressed—it probably made fewer mistakes than I would have. I initially gave it the [09-persistent-matmul tutorial](https://triton-lang.org/main/getting-started/tutorials/09-persistent-matmul.html) and asked it to modify it.
 
-I don't think this kernel is very well optimized; from my memory, I vaguely recall that it was getting around 300-400 TFlops on H100 for the B=2, SL=512, dim=384 case that I was doing most of my local testing on. But at least on H100, it appeared to provide modest speedups and was better than the unfused implementation.
+I don't think this kernel is very well optimized; from my memory, I vaguely recall that it was getting around 300-400 TFlops on H100 on my testing configuration. But at least on H100, it appeared to provide modest speedups and was better than the unfused implementation.
 
 Here's a simplified sketch of the kernel structure:
 
@@ -155,11 +157,11 @@ out = out * out_gate
 
 I started with torch.compile-ing this, but found that max-autotune caused timeouts and default heuristics were not much better than eager mode. (I believe the PyTorch team is working on improving the heuristics, but those improvements certainly aren't available in PyTorch 2.7.1, used for this competition)
 
-I wrote a simple layernorm that reads a 2d block and reduces over the reduction dimension. My experience with normalizations is that as long as you have enough bytes in flight, you can generally get relatively good performance from Triton.
+I wrote a simple layernorm that reads a 2D block and reduces over the reduction dimension (and fuses the elementwise matmul). My experience with normalizations is that as long as you have enough bytes in flight, you can generally get relatively good performance from Triton.
 
-However, this layernorm is a special case—it is reducing over a tensor of shape `[B, SL, SL, dim]` with strides `[SL*SL*dim, SL, 1, SL*SL]` and dim=128—i.e. the reduction dimension is not contiguous. Through autotuning, Triton selected a 16×128 block with num_warps=1. I was pretty surprised by this, as in this case 16×fp32 is only 64 bytes (or 16×fp16, as I tried later, is only 32 bytes)—less than the 128-byte cache lines. I probably won't have time, but I think it would be interesting to follow up on why this is the case for Triton.
+However, this layernorm is a special case; it is reducing over a tensor of shape `[B, SL, SL, dim]` with strides `[SL*SL*dim, SL, 1, SL*SL]` and dim=128—i.e. the reduction dimension is not contiguous. Through autotuning, Triton selected a 16×128 block with num_warps=1. I was pretty surprised by this, as in this case 16×fp32 is only 64 bytes (or 16×fp16, as I tried later, is only 32 bytes)—less than the 128-byte cache lines. I probably won't have time, but I think it would be interesting to follow up on why this is the case for Triton.
 
-Next I substituted a Triton implementation for the first layernorm, where improved bandwidth can have an even larger overall effect on latency due to the (potentially) larger dimension which can be more than the hidden dimension of 128.
+Next I substituted a Triton implementation for the first layernorm (a pure layernorm without any fused epilogue), where improved bandwidth can have an even larger overall effect on latency due to the (potentially) larger dimension which can be more than the hidden dimension of 128.
 
 ```python
 x = self.norm(x)
@@ -249,7 +251,7 @@ With a vast.ai rental, I observed with torch.profile that `two_mm` was the obvio
 
 ![A100 profiler trace showing two_mm as the bottleneck](https://davidberard98.github.io/gpumode-trimul/long-a100-twomm.png)
 
-I then wasted an hour trying to find a cloud provider with A100s that supported NCU.
+I then wasted an hour trying to find a cloud provider with A100s that supported NCU, but ran out of time before making any significant progress.
 
 ## Other Ideas
 
